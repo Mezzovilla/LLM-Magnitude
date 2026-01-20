@@ -1,9 +1,14 @@
+# Magnitude 
 
-# Hugging Face Token
+## Configuration
+
+### Hugging Face Token
 
 Check [this tutorial](https://www.youtube.com/watch?v=1h6lfzJ0wZw&t=732s) for creating a token.
 
-# Download the model
+### Download the model
+
+Here we've tryed using [this Norod78 model](https://huggingface.co/Norod78/english-sienfeld-distilgpt2).
 
 Choose the model name as the `checkpoint` variable:
 
@@ -17,7 +22,6 @@ model = AutoModelForCausalLM.from_pretrained(checkpoint)
 ```
 
 After reading the model, install it in the local package:
-
 
 ```python
 from pathlib import Path
