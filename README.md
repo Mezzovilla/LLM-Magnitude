@@ -8,13 +8,13 @@ Check [this tutorial](https://www.youtube.com/watch?v=1h6lfzJ0wZw&t=732s) for cr
 
 ### Download the model
 
-Here we've tryed using [this Norod78 model](https://huggingface.co/Norod78/english-sienfeld-distilgpt2).
+Here we've tryed using [SmolLM2](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B).
 
 Choose the model name as the `checkpoint` variable:
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
-checkpoint = "Norod78/english-sienfeld-distilgpt2"
+checkpoint = "HuggingFaceTB/SmolLM2-135M"
 
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
 # for multiple GPUs install accelerate and do `model = AutoModelForCausalLM.from_pretrained(checkpoint, device_map="auto")`
@@ -25,7 +25,7 @@ After reading the model, install it in the local package:
 
 ```python
 from pathlib import Path
-project_path = Path().cwd().parent
+project_path = Path().cwd()
 
 model_path = project_path / f"models/{checkpoint}"
 

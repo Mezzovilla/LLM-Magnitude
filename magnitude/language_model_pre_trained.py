@@ -24,44 +24,6 @@ from magnitude.language import (
 )
 torch.manual_seed(0)
 
-TOKENS = ["A", "B", "<EOS>"]
-SPLITTING_CHAR = "|"
-
-def _get_tokens(phrases: t.List[str]) -> t.List[str]:
-    tokens = []
-    for p in phrases:
-        if len(p) == 0:
-            continue
-
-        for t in p.split(' '):
-            if t not in tokens:
-                tokens.append(t)
-    tokens.append("<EOS>")
-    return tokens
-
-def next_token_dataset(
-        phrases: t.List[str], 
-        tokens: t.Optional[t.List[str]] = None
-    ) -> t.Tuple[t.List[str], t.List[str]] :
-    contexts, targets = [], []
-
-    if tokens is None:
-        tokens = _get_tokens(phrases)
-
-    for p in phrases:
-        # if p == "":
-        #     context = []
-        # else:
-        #     context = p.split()
-
-        for t in tokens:
-            candidate = (p + " " + t).strip()
-
-            if candidate in phrases:
-                contexts.append(p)
-                targets.append(t)
-
-    return contexts, targets
 
 LEFT_SPACE = 'Ġ'
 
@@ -71,10 +33,46 @@ from dataclasses import dataclass, field
 class PreTrainedLM():
     model: t.Union[GPT2LMHeadModel, nn.Module]
     tokenizer: GPT2TokenizerFast
-    complete_phrases: t.List[str]
+    complete_sentences: t.List[str]
     phrases: t.List[str] = field(init=False)
-    tokens: t.List[str] = field(init = False)
-    vocab_size: int = field(init=False)
+    tokens: t.List[str] = field(init=False)
+
+    # Derived / internal
+    sentence_ids: t.List[torch.Tensor] = field(init=False)
+    prefix_ids: t.List[torch.Tensor] = field(init=False)
+    num_prefixes: int = field(init=False)
+
+    def encode(self, text: str) -> torch.Tensor:
+        """Encode text into a 1D tensor of token ids (no special tokens)."""
+        return self.tokenizer(
+            text, add_special_tokens=False, return_tensors="pt"
+        ).input_ids[0]
+
+    def decode(self, ids: torch.Tensor) -> str:
+        """Decode token ids into text."""
+        return self.tokenizer.decode(ids.tolist())
+
+    def build_prefix_space(self) -> t.List[torch.Tensor]:
+        """
+        From complete sentences, build the set of all non-empty prefixes
+        in token-id space.
+        """
+        prefixes: t.List[torch.Tensor] = []
+
+        for ids in self.sentence_ids:
+            for k in range(1, len(ids) + 1):
+                prefixes.append(ids[:k])
+
+        # remove duplicates while preserving order
+        seen = set()
+        unique_prefixes = []
+        for p in prefixes:
+            key = tuple(p.tolist())
+            if key not in seen:
+                seen.add(key)
+                unique_prefixes.append(p)
+
+        return unique_prefixes
 
     def get_tokens(self, 
             phrases: t.Optional[t.Union[t.List[str], str]] = None, 
@@ -97,7 +95,7 @@ class PreTrainedLM():
     def from_complete_sentences(self, verbose: bool = False) -> t.List[str]:
         phrases = []
 
-        for sentence in self.complete_phrases:
+        for sentence in self.complete_sentences:
             tokens = self.tokenizer.tokenize(sentence)
 
             for i in range(len(tokens)):
@@ -106,76 +104,101 @@ class PreTrainedLM():
         return phrases
 
     def __post_init__(self):
-        if not isinstance(self.complete_phrases, list):
-            raise ValueError('Phrases must be a list of strings.')
-        
-        self.tokens = self.get_tokens(self.complete_phrases)
-        self.phrases = self.from_complete_sentences() 
-        self.vocab_size = len(self.phrases)
+        if not isinstance(self.complete_sentences, list):
+            raise ValueError("complete_sentences must be a list of strings.")
 
-    def token_probability(self, y_token: str, x: str, verbose: bool = False) -> float:
-        '''p(a | x), a in {tokens}, x in {tokens}*'''
-        input_ids = self.tokenizer(x, return_tensors="pt").input_ids
+        # Encode sentences once
+        self.sentence_ids = [self.encode(s) for s in self.complete_sentences]
 
-        out = self.model(input_ids)
-        logits = out.logits[0, -1]
+        # Build prefix space
+        self.prefix_ids = self.build_prefix_space()
+        self.num_prefixes = len(self.prefix_ids)
 
-        y_id = self.tokenizer.encode(y_token, add_special_tokens=False)[0]
-        probs = 1/(1 + np.exp(-logits[y_id].item()))
+
+        # self.tokens = self.get_tokens(self.complete_sentences)
+        self.phrases = self.from_complete_sentences()
+
+    @torch.no_grad()
+    def token_probability(
+            self,
+            y_id: int,
+            x_ids: torch.Tensor,
+            verbose: bool = False,
+        ) -> float:
+        """
+        p(y | x), where:
+          - y_id is a token id
+          - x_ids is a 1D tensor of token ids
+        """
+        logits = self.model(x_ids.unsqueeze(0)).logits[0, -1]
+        prob = F.softmax(logits, dim=-1)[y_id].item()
 
         if verbose:
-            print(f"p({y_token=} | {x=}) = {probs}".replace(LEFT_SPACE, " "))
-        return probs
+            x_str = self.decode(x_ids)
+            y_str = self.decode(torch.tensor([y_id]))
+            print(f"p({y_str!r} | {x_str!r}) = {prob:.6f}")
+
+        return prob
 
 
+    @torch.no_grad()
     def extension_probability(
-            self, 
-            y: str, 
-            x: str, 
-            verbose: bool = False, 
+            self,
+            y_ids: torch.Tensor,
+            x_ids: torch.Tensor,
+            verbose: bool = False,
         ) -> float:
-        '''pi(y | x) = prod p(yi | xy[0..i-1]),  y, x in {tokens}*'''
-        if not y.startswith(x):
+        """
+        π(y | x) = ∏ p(y_i | x y_1 ... y_{i-1})
+
+        Returns:
+          0 if x is not a prefix of y
+          1 if x == y
+        """
+        if len(x_ids) > len(y_ids):
             return 0.0
-        
-        if x == y:
+
+        if not torch.equal(y_ids[: len(x_ids)], x_ids):
+            return 0.0
+
+        if len(x_ids) == len(y_ids):
             return 1.0
 
-        x_tokens = self.get_tokens(x, sort=False)
-        y_tokens = self.get_tokens(y, sort=False)
+        probs = []
+        xt = x_ids.clone()
 
-        new_tokens = [y_tokens[i] for i in range(len(x_tokens), len(y_tokens))]
-        
-        probs = [0.0 for _ in new_tokens]
-        xt = x
-    
-        for i, yt in enumerate(new_tokens):
-            probs[i] = self.token_probability(yt, xt, verbose)
-            xt += yt
+        for yi in y_ids[len(x_ids):]:
+            p = self.token_probability(int(yi.item()), xt, verbose)
+            probs.append(p)
+            xt = torch.cat([xt, yi.view(1)])
 
         pi = float(np.prod(probs))
 
         if verbose:
-            print(f"{probs=}")
-            print(f"pi({y=}|{x=}) = {pi}")
+            print(f"probs = {probs}")
+            print(f"π(y | x) = {pi}")
 
         return pi
 
-    def similarity_matrix(self, phrases: t.Optional[t.List[str]] = None) -> pd.DataFrame:
-        if phrases is None:
-            phrases = self.phrases
-        phrases = list(dict.fromkeys(phrases))  # remove duplicates, preserve order
-        sim_matrix = np.zeros((len(phrases), len(phrases)))
+    @property
+    def similarity_matrix(self) -> pd.DataFrame:
+        """
+        Similarity matrix S where:
+          S[i, j] = π(prefix_j | prefix_i)
+        """
+        n = len(self.prefix_ids)
+        mat = np.zeros((n, n))
 
-        for i, y_phrase in enumerate(phrases):
-            for j, x_phrase in enumerate(phrases):
-                sim_matrix[i, j] = self.extension_probability(x_phrase, y_phrase)
-        return pd.DataFrame(sim_matrix, index = phrases, columns=phrases)
+        for i, x in enumerate(self.prefix_ids):
+            for j, y in enumerate(self.prefix_ids):
+                mat[i, j] = self.extension_probability(y, x)
+
+        labels = [self.decode(p) for p in self.prefix_ids]
+        return pd.DataFrame(mat, index=labels, columns=labels)
     
-    def metric_space(self, phrases: t.Optional[t.List[str]] = None, **kargs) -> MetricSpace:
-        if phrases is None:
-            phrases = self.phrases
-        return MetricSpace(similarity=self.similarity_matrix(phrases), **kargs)
+    @property
+    def metric_space(self, **kargs) -> MetricSpace:
+        return MetricSpace(similarity=self.similarity_matrix, **kargs)
 
     def lm_magnitude(self,
             phrases: t.Optional[t.List[str]] = None,
@@ -201,7 +224,7 @@ class PreTrainedLM():
         if phrases is None:
             phrases = self.phrases
 
-        df_sim = self.similarity_matrix(phrases)
+        df_sim = self.similarity_matrix
         if verbose:
             print(":: Similarity matrix:")
             print(df_sim)
@@ -246,7 +269,7 @@ MODELS = {
 def pretrained_model():
     project_path = Path(__file__).parent
 
-    checkpoint = "Norod78/english-sienfeld-distilgpt2"
+    checkpoint = "HuggingFaceTB/SmolLM2-135M-Instruct"
     model_path = project_path / f"models/{checkpoint}"
     print(':: Reading model')
 
@@ -259,24 +282,31 @@ def pretrained_model():
 
     print(f":: Memory footprint: {model.get_memory_footprint() / 1e6:.2f} MB")
 
-    complete_phrases = [
+    complete_sentences = [
         # "The cat sleeps in the living room",
         # "The cat runs in the living room",
-        # "The dog runs in the yard",
+        "The dog runs in the yard",
+        "The dog doesn\'t sleeps in the yard",
         "The dog runs",
-        "The cat sleeps",
+        # "The cat sleeps",
         # "The cockroach flies in the house"
     ]
 
-    pt_model = PreTrainedLM(model, tokenizer, complete_phrases)
+    pt_model = PreTrainedLM(model, tokenizer, complete_sentences)
 
     # pt_model.extension_probability(x='The cat', y='The cat runs in the living room', verbose=True)
 
     # pt_model.token_probability(y_token=LEFT_SPACE+'runs', x='The dog', verbose=True)
 
-    print(pt_model.similarity_matrix())
-    # print(pt_model.lm_magnitude())
-    # print(pt_model.metric_space())
+    df= pt_model.similarity_matrix
+    print(df)
+    print(df.shape)
+    # print(f"magnitude = {pt_model.lm_magnitude()}")
+    ms_model = pt_model.metric_space
+    curve = ms_model.magnitude_curve()
+    
+    curve.to_csv("magnitude_curve.csv")
+
 
 if __name__ == '__main__':
     pretrained_model()

@@ -164,7 +164,7 @@ class MetricSpace:
 
     # |tA|, t > 1
     # ===============
-    def magnitude_curve(self, scales: t.Union[t.List[float], np.ndarray]) -> pd.DataFrame:
+    def magnitude_curve(self, scales: t.Union[t.List[float], np.ndarray] = np.linspace(0.01, 10.0, 50)) -> pd.DataFrame:
         # empty dataframe
         df = pd.DataFrame({
             "Scale": scales,
@@ -181,7 +181,7 @@ class MetricSpace:
         
         return df
     
-    def plot_magnitude_curve(self, scales: t.Union[t.List[float], np.ndarray], verbose: bool = False) -> Figure:
+    def plot_magnitude_curve(self, scales: t.Union[t.List[float], np.ndarray]= np.linspace(0.01, 10.0, 50), verbose: bool = False) -> Figure:
         df = self.magnitude_curve(scales)
         if verbose:
             print(df)
