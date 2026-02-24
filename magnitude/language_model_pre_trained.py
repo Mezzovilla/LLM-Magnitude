@@ -9,7 +9,6 @@ import typing as t
 import matplotlib.pyplot as plt
 from rich import print
 from collections import defaultdict
-from tqdm import tqdm
 from pathlib import Path
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -22,8 +21,10 @@ from magnitude.language import (
     generate_all_sentences,
     random_language
 )
+from magnitude.display import progress_bar
 torch.manual_seed(0)
 
+from functools import cached_property
 
 LEFT_SPACE = 'Ġ'
 
@@ -41,6 +42,8 @@ class PreTrainedLM():
     sentence_ids: t.List[torch.Tensor] = field(init=False)
     prefix_ids: t.List[torch.Tensor] = field(init=False)
     num_prefixes: int = field(init=False)
+
+    _similarity_matrix: pd.DataFrame = field(init=False)
 
     def encode(self, text: str) -> torch.Tensor:
         """Encode text into a 1D tensor of token ids (no special tokens)."""
@@ -119,66 +122,38 @@ class PreTrainedLM():
         self.phrases = self.from_complete_sentences()
 
     @torch.no_grad()
-    def token_probability(
-            self,
-            y_id: int,
-            x_ids: torch.Tensor,
-            verbose: bool = False,
-        ) -> float:
-        """
-        p(y | x), where:
-          - y_id is a token id
-          - x_ids is a 1D tensor of token ids
-        """
-        logits = self.model(x_ids.unsqueeze(0)).logits[0, -1]
-        prob = F.softmax(logits, dim=-1)[y_id].item()
-
-        if verbose:
-            x_str = self.decode(x_ids)
-            y_str = self.decode(torch.tensor([y_id]))
-            print(f"p({y_str!r} | {x_str!r}) = {prob:.6f}")
-
-        return prob
-
-
-    @torch.no_grad()
-    def extension_probability(
-            self,
-            y_ids: torch.Tensor,
-            x_ids: torch.Tensor,
-            verbose: bool = False,
-        ) -> float:
-        """
-        π(y | x) = ∏ p(y_i | x y_1 ... y_{i-1})
-
-        Returns:
-          0 if x is not a prefix of y
-          1 if x == y
-        """
-        if len(x_ids) > len(y_ids):
-            return 0.0
-
-        if not torch.equal(y_ids[: len(x_ids)], x_ids):
-            return 0.0
-
-        if len(x_ids) == len(y_ids):
+    def pi(self, x: str, y: str) -> float:
+        # Caso x == y
+        if x == y:
             return 1.0
 
-        probs = []
-        xt = x_ids.clone()
+        # Tokenização
+        x_ids = self.tokenizer(x, add_special_tokens=False).input_ids
+        y_ids = self.tokenizer(y, add_special_tokens=False).input_ids
 
-        for yi in y_ids[len(x_ids):]:
-            p = self.token_probability(int(yi.item()), xt, verbose)
-            probs.append(p)
-            xt = torch.cat([xt, yi.view(1)])
+        # Verifica se x é prefixo de y
+        if y_ids[:len(x_ids)] != x_ids:
+            return 0.0
 
-        pi = float(np.prod(probs))
+        # Forward pass única com y inteiro
+        inputs = torch.tensor([y_ids])
+        outputs = self.model(input_ids=inputs)
 
-        if verbose:
-            print(f"probs = {probs}")
-            print(f"π(y | x) = {pi}")
+        # Logits: (1, seq_len, vocab_size)
+        logits = outputs.logits
 
-        return pi
+        log_prob = 0.0
+
+        for i in range(len(x_ids), len(y_ids)):
+            token_id = y_ids[i]
+
+            # logits que predizem y[i] vêm da posição i-1
+            step_logits = logits[0, i-1]
+            step_log_probs = F.log_softmax(step_logits, dim=-1)
+
+            log_prob += step_log_probs[token_id].item()
+
+        return np.exp(log_prob)
 
     @property
     def similarity_matrix(self) -> pd.DataFrame:
@@ -186,15 +161,25 @@ class PreTrainedLM():
         Similarity matrix S where:
           S[i, j] = π(prefix_j | prefix_i)
         """
-        n = len(self.prefix_ids)
-        mat = np.zeros((n, n))
+        if hasattr(self, "_similarity_matrix"):
+            return self._similarity_matrix
+        
+        labels = self.phrases
+        n = len(labels)
+        mat = np.eye(n)
 
-        for i, x in enumerate(self.prefix_ids):
-            for j, y in enumerate(self.prefix_ids):
-                mat[i, j] = self.extension_probability(y, x)
+        total = int(n * (n-1) / 2)
+        counter = 0
+        progress_bar(counter, total)
+        for i, x in enumerate(labels):
+            for j in range(i+1, n):
+                y = labels[j]
+                mat[i, j] = self.pi(y, x)
+                counter += 1
+                progress_bar(counter, total)
 
-        labels = [self.decode(p) for p in self.prefix_ids]
-        return pd.DataFrame(mat, index=labels, columns=labels)
+        self._similarity_matrix = pd.DataFrame(mat, index=labels, columns=labels)
+        return self._similarity_matrix
     
     @property
     def metric_space(self, **kargs) -> MetricSpace:
@@ -256,21 +241,15 @@ class PreTrainedLM():
 
                     if verbose:
                         print(f":: Adding P({y=} | {prefix=}) = {df_sim[y][prefix]}")
-                        print(f"   Current sum: {df_sim.shape[0] - magnitude_upper_sum}")
+                        print(f"   Current magnitude: {df_sim.shape[0] - magnitude_upper_sum}")
 
         return df_sim.shape[0] - magnitude_upper_sum
-
-MODELS = {
-    # "not": "danurahul/alex_gpt3_Doctextfull2",
-    # "Norod78/hewiki-articles-distilGPT2py-il",
-    'distil_gpt2': "Norod78/english-sienfeld-distilgpt2",
-}
 
 def pretrained_model():
     project_path = Path(__file__).parent
 
     checkpoint = "HuggingFaceTB/SmolLM2-135M-Instruct"
-    model_path = project_path / f"models/{checkpoint}"
+    model_path = project_path.parent / f"models/{checkpoint}"
     print(':: Reading model')
 
     tokenizer = (AutoTokenizer
@@ -286,8 +265,8 @@ def pretrained_model():
         # "The cat sleeps in the living room",
         # "The cat runs in the living room",
         "The dog runs in the yard",
-        "The dog doesn\'t sleeps in the yard",
-        "The dog runs",
+        # "The dog doesn\'t sleeps in the yard",
+        # "The dog runs",
         # "The cat sleeps",
         # "The cockroach flies in the house"
     ]
@@ -298,15 +277,60 @@ def pretrained_model():
 
     # pt_model.token_probability(y_token=LEFT_SPACE+'runs', x='The dog', verbose=True)
 
-    df= pt_model.similarity_matrix
-    print(df)
-    print(df.shape)
     # print(f"magnitude = {pt_model.lm_magnitude()}")
     ms_model = pt_model.metric_space
-    curve = ms_model.magnitude_curve()
     
-    curve.to_csv("magnitude_curve.csv")
+    # curve = ms_model.magnitude_curve()
+    
+    # curve.to_csv("magnitude_curve.csv")
+
+def read_opus_text():
+    from rich import print
+    project_path = Path(__file__).parent.parent
+
+    print(':: Reading texts')
+    en_pt_data_path = project_path / 'data/en-pt_BR.txt/'
+
+    data = {}
+    # open zip txt file
+    with open(en_pt_data_path / 'MDN_Web_Docs.en-pt_BR.en', 'rb') as f:
+        data['en'] = f.read()
+
+    sample_size = 165 #324 #956
+    sample_data = str(data['en'][:sample_size])
+
+    complete_sentences = sample_data.split("\\n")[1:]
+
+    print(complete_sentences)
+
+    checkpoint = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    model_path = project_path.parent / f"models/{checkpoint}"
+    print(':: Reading model')
+
+    tokenizer = (AutoTokenizer
+        .from_pretrained(model_path, local_files_only=True)
+    )
+    model = (AutoModelForCausalLM
+        .from_pretrained(model_path, local_files_only=True)
+    )
+
+    print(':: Loading class')
+    pt_model = PreTrainedLM(model, tokenizer, complete_sentences)
+
+    print(':: Computing similarity matrix')
+    df: pd.DataFrame = pt_model.similarity_matrix
+
+    print(':: Saving sentences')
+    with open(project_path / "data/labels.txt", 'w') as f:
+        f.write("\n".join(df.index))
+ 
+    new_labels = list(map(str, range(0, df.shape[0])))
+    
+    df.index = new_labels
+    df.columns = new_labels
+    print(':: Saving data-frame')
+    df.to_parquet(project_path / "data/sim_matrix.parquet")
 
 
 if __name__ == '__main__':
-    pretrained_model()
+    read_opus_text()

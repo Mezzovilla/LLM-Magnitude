@@ -43,3 +43,23 @@ def display_pd(
     df_fmt = df_show.map(format_value)
 
     return df_fmt
+
+import sys
+
+def progress_bar(current: int, total: int, bar_width: int = 40):
+    if total <= 0:
+        raise ValueError("total must be a positive integer")
+
+    # Clamp current to [0, total]
+    current = max(0, min(current, total))
+
+    progress = current / total
+    filled = int(bar_width * progress)
+    bar = "█" * filled + "-" * (bar_width - filled)
+    percent = progress * 100
+
+    sys.stdout.write(f"\r[{bar}] {percent:6.2f}% ({current}/{total})")
+    sys.stdout.flush()
+
+    if current == total:
+        print()  # newline at completion
